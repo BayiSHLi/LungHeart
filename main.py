@@ -5,11 +5,10 @@ import numpy as np
 import torch
 import yaml
 import albumentations as A
-# from albumentations.pytorch import ToTensorV2
 import random
+from model.clap import PretrainedCLAP
 
-import utils
-import model
+from utils import *
 from run import Trainer
 
 def parse_args():
@@ -19,14 +18,18 @@ def parse_args():
     parser.add_argument('--model_cfg', default='./config/ICBHIMode.yaml')
     parser.add_argument('--data_root', default= '/dataset/ICBHI/')
     parser.add_argument('--sample_rate', default= 16000)
-    parser.add_argument('--epochs', type=int, default=200)
+    parser.add_argument('--desired_length', default= 8)
+    parser.add_argument('--pad_types', default= 'zero')
+    parser.add_argument('--fade_samples_ratio', default= 16)
+    parser.add_argument('--epochs', type=int, default=50)
     parser.add_argument('--start_epoch', type=int, default=0)
-    parser.add_argument('--early_stop', type=int, default=30)
-    parser.add_argument('--batch_size', type = int, default=40)
+    parser.add_argument('--early_stop', type=int, default=10)
+    parser.add_argument('--batch_size', type = int, default=80)
     parser.add_argument('--num_workers', type=int, default=0)
     parser.add_argument('--seed', type=int, default=3407)
-    parser.add_argument('--gpu', default=1, type=int)
+    parser.add_argument('--gpu', default=0, type=int)
     parser.add_argument('--lr', type=float, default=0.00001)
+    parser.add_argument('--lr_minimum', type=float, default=0.000001)
     parser.add_argument('--lr_head', type=float, default=0.001)
     parser.add_argument('--lr_scheduler', type=bool, default=True)
     parser.add_argument('--weight_decay', type=float, default=1e-3)
@@ -36,7 +39,7 @@ def parse_args():
     parser.add_argument('--vis', action='store_true')
     parser.add_argument('--test', action='store_true')
     parser.add_argument('--pretrained', action='store_true')
-    parser.add_argument('--ckpt_path', default='./best_ckpt.pth')
+    parser.add_argument('--ckpt_path', default='./experiments/ICBHI-1009/066/ckpt/ICBHI_val_2_0.7748.pth')
     args = parser.parse_args()
 
     print(args)
@@ -61,6 +64,7 @@ def init_cfg(args):
         "early_stop": args.early_stop,
         "lr": args.lr,
         "lr_head": args.lr_head,
+        "lr_minimum": args.lr_minimum,
         "lr_scheduler": args.lr_scheduler,
         "exp_path": os.path.join(args.save_path, args.exp_name),
         "vis": args.vis,
@@ -88,14 +92,14 @@ def init_cfg(args):
     os.makedirs(os.path.join(cfg['vis_path'], 'test'), exist_ok=True)
     os.makedirs(cfg['save_path'] , exist_ok=True)
 
-    cfg['metrics'] = MeanIoU(num_classes=19)
+    cfg['metrics'] = [BinaryAccuracy(), BinaryAccuracy(), MultiClassAccuracy(num_classes=8), NormalAbnormalAccuracy()]
 
     return cfg
 
 def init_model(args):
     with open(args.model_cfg, 'r', encoding='utf-8') as f:
         model_cfg = yaml.load(f.read(), Loader=yaml.FullLoader)
-    model = AudioMambaModel(**model_cfg)
+    model = PretrainedCLAP(**model_cfg)
     if args.pretrained:
         model.load_state_dict(torch.load(args.ckpt_path),
                               strict=True)
@@ -104,20 +108,30 @@ def init_model(args):
 
 def init_dataset(args):
     root = args.data_root
-    transform = AudioAugmentor(args.sample_rate)
+
+    transform = A.Compose([
+        # A.HorizontalFlip(p=0.5),  # 50% 概率水平翻转
+        # A.VerticalFlip(p=0.5),
+        A.ShiftScaleRotate(shift_limit=0.1, scale_limit=0.2, rotate_limit=45, p=0.3),  # 随机平移、缩放和旋转
+        A.RandomGridShuffle(grid=(3,3), p=0.3),
+        # A.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1, p=0.5),  # 颜色抖动
+        A.RandomBrightnessContrast(p=0.2),
+        A.GaussianBlur(blur_limit=(3, 7), p=0.3),  # 随机高斯模糊
+        A.GaussNoise(var_limit=(10.0, 50.0), p=0.3),  # 添加随机噪声
+        # ToTensorV2()  # 转换为PyTorch张量
+    ])
 
     data_cfg = {"data_root": args.data_root,
-               "mode": args.mode,
                 "sample_rate": args.sample_rate,
                 "desired_length": args.desired_length,
                 "pad_types": args.pad_types,
                 "fade_samples_ratio": args.fade_samples_ratio,
                 "transform":transform}
 
-    train_set = ICBHIDataset(**data_cfg)
+    train_set = ICBHIDataset(**data_cfg, mode='train')
 
     data_cfg["transform"] = None
-    test_set = ICBHIDataset(**data_cfg)
+    test_set = ICBHIDataset(**data_cfg, mode='test')
 
     return train_set, test_set
 
@@ -150,8 +164,8 @@ def main():
     trainer = Trainer(model=model, train_set=train_set, test_set=test_set, **cfg)
     if args.test:
         trainer.test(args.ckpt_path)
-        trainer.f_measure(args.ckpt_path)
-        trainer.model.backbone.patch_embed1.vis_attn_map()
+        # trainer.f_measure(args.ckpt_path)
+        # trainer.model.backbone.patch_embed1.vis_attn_map()
     else:
         best_ckpt_path = trainer.train()
         result = trainer.test(best_ckpt_path)

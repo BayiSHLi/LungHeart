@@ -1,0 +1,2 @@
+pretrained_name: laion/clap-htsat-unfused
+final_feat_dim: 64

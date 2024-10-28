@@ -1,19 +1,12 @@
-import os
 import time
-import numpy as np
-import pandas as pd
-import cv2
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 import tqdm
-from PIL import Image
-from sklearn.metrics import *
 from tqdm import tqdm
-from utils.metrics import *
-from utils.losses import LovaszLoss
-from utils.vis import vis_result
-from torchmetrics.functional import f1_score
+
+# from torchmetrics.functional import f1_score
+from sklearn.model_selection import KFold
 from fvcore.nn import FlopCountAnalysis
 
 import copy
@@ -49,7 +42,7 @@ class Trainer():
     def __init__(self, model, train_set, test_set,
                  model_name, device, batch_size, num_workers, epochs,
                  exp_name, exp_path, ckpt_path, vis_path, save_path, num_exp,
-                 start_epoch=0, early_stop=5, lr=1e-5, lr_head=1e-4,
+                 start_epoch=0, early_stop=5, lr=1e-5, lr_head=1e-4, lr_minimum=1e-6,
                  lr_scheduler=True, save_threshold=0.7, metrics=None, vis=False):
         self.model = model
         self.train_set = train_set
@@ -72,44 +65,34 @@ class Trainer():
 
         self.save_threshold = save_threshold
 
+        self.num_folds = 5
+        self.kf = KFold(n_splits=self.num_folds, shuffle=True, random_state=42)
+
         self.lr = lr
         self.lr_head = lr_head
+        self.lr_minimum = lr_minimum
 
         self.metrics = metrics
 
         self.CEloss = nn.CrossEntropyLoss()
-        self.Lovaszloss = LovaszLoss()
+        self.BCEloss = nn.BCELoss()
 
         self.best_ckpt_path = None
 
         self.optimizer = torch.optim.Adam([
-            {"params": self.model.backbone.parameters()},
-            {"params": self.model.head.parameters(), "lr": self.lr_head},],
+            {"params": self.model.audio_features.parameters()},
+            {"params": self.model.classifier.parameters(), "lr": self.lr_head},],
             lr=self.lr, weight_decay=5e-5)
         if lr_scheduler:
             self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
                 self.optimizer,
                 T_max=self.num_epochs,
-                eta_min=1e-6,
+                eta_min=self.lr_minimum,
                 verbose=True)
-
-        self.train_data = DataLoader(
-            self.train_set, self.batch_size, num_workers=self.num_workers,
-            pin_memory=True, shuffle=True, drop_last=True,
-        )
-
-        self.val_data = DataLoader(
-            self.val_set, self.batch_size, num_workers=self.num_workers,
-            pin_memory=True, shuffle=True, drop_last=True,
-        )
-
-        self.test_data = DataLoader(
-            self.test_set, batch_size=1, shuffle=False,
-        )
 
     def train(self):
         wandb.init(
-            project = 'celebA',
+            project = 'ICBHI',
             name=self.exp_name + '_' + self.num_exp,
             config={
                 "learning_rate": self.lr,
@@ -122,115 +105,152 @@ class Trainer():
         self.model.to(self.device)
         total_params = sum(p.numel() for p in self.model.parameters())
         print(f'Total trainable parameters: {total_params}')
-        assert total_params < 2_000_000, f"Model has {total_params} parameters, which exceeds the limit."
 
         best_model_wts_test = copy.deepcopy(self.model.state_dict())
         best_iou_test = 0.0
         best_epoch_test = 0
-        is_earlystop = False
 
         print('-' * 10)
         print('TRAIN')
         print('-' * 10)
 
-        for epoch in range(self.start_epoch, self.start_epoch + self.num_epochs):
-            if is_earlystop:
-                break
-            # Train phase
-            self.model.train()
+        for fold, (train_idx, val_idx) in enumerate(self.kf.split(self.train_set)):
+            print(f'Fold {fold + 1}/{self.num_folds}')
+            train_subset = Subset(self.train_set, train_idx)
+            val_subset = Subset(self.train_set, val_idx)
 
-            running_loss = 0.0
+            self.train_data = DataLoader(
+                train_subset, self.batch_size, num_workers=self.num_workers,
+                pin_memory=True, shuffle=True, drop_last=True,
+            )
+            self.val_data = DataLoader(
+                val_subset, self.batch_size, num_workers=self.num_workers,
+                pin_memory=True, shuffle=False,
+            )
+            is_earlystop = False
 
-            pbar = tqdm(self.train_data)
+            for epoch in range(self.start_epoch, self.start_epoch + self.num_epochs):
+                if is_earlystop:
+                    break
+                # Train phase
+                self.model.train()
 
-            for i, batch in enumerate(pbar):
-                self.optimizer.zero_grad()
-                images, masks = batch
+                running_loss = 0.0
 
-                images = images.to(self.device)
-                masks = masks.to(self.device)
+                pbar = tqdm(self.train_data)
 
-                outputs = self.model(images)
-                loss = self.CEloss(outputs, masks) + self.Lovaszloss(outputs, masks)
-
-                loss.backward()
-                self.optimizer.step()
-
-                running_loss += loss.item() * images.size(0)
-
-                train_loss = running_loss / ((i + 1)*self.batch_size)
-
-                wandb.log({"train_loss": train_loss})
-                wandb.log({"loss": loss})
-
-                pbar.set_description(
-                    f'Epoch {epoch}/{self.start_epoch + self.num_epochs - 1}, training loss {train_loss:.4f}')
-
-            epoch_loss = running_loss / len(self.train_set)
-            print('Train Loss: {:.4f} '.format(epoch_loss))
-
-            if self.scheduler:
-                self.scheduler.step()
-                wandb.log({"learning rate": self.optimizer.param_groups[0]['lr']})
-                wandb.log({"learning rate head": self.optimizer.param_groups[1]['lr']})
-
-            # Validation phase
-            if (epoch+1) % 1 == 0:
-                self.model.eval()
-                # for metric in self.metrics:
-                #     metric.reset_epoch_stats()
-                self.metrics.reset(self.device)
-                print('-' * 10)
-                print('VAL')
-                print('-' * 10)
-
-                val_loss = 0.0
-                val_pred = []
-                val_label = []
-
-                pbar = tqdm(self.val_data)
-                vis_save = []
                 for i, batch in enumerate(pbar):
-                    images, masks = batch
-                    images = images.to(self.device)
-                    masks = masks.to(self.device)
+                    self.optimizer.zero_grad()
+                    audio, label, text_inputs, attn_masks = batch
 
-                    with torch.no_grad():
-                        outputs = self.model(images)
-                        loss = self.CEloss(outputs, masks) + self.Lovaszloss(outputs, masks)
-                        self.metrics.update(outputs, masks)
-                    preds = torch.argmax(outputs, dim=1)
-                    if self.vis:
-                        vis_outs = vis_result(images, preds, masks)
-                        vis_save = vis_save + vis_outs
-                    val_loss += loss.item() * images.size(0)
-                    val_pred.extend(preds.view(-1).tolist())
-                    val_label.extend(masks.view(-1).tolist())
+                    audio = audio.to(self.device)
+                    gt_crackles, gt_wheezes, gt_diagnosis = label
+                    gt_crackles, gt_wheezes, gt_diagnosis = gt_crackles.to(self.device), \
+                                                            gt_wheezes.to(self.device), gt_diagnosis.to(self.device)
+                    gt_crackles, gt_wheezes, gt_diagnosis = \
+                        gt_crackles[:, None].type(torch.float32), gt_wheezes[:, None].type(torch.float32), \
+                        gt_diagnosis[:, None].long().squeeze()
+                    text_inputs = text_inputs.to(self.device)
+                    attn_masks = attn_masks.to(self.device)
+
+                    pred_crackles, pred_wheezes, pred_diagnosis = self.model(audio, text_inputs, attn_masks)
+
+                    loss = self.BCEloss(pred_crackles, gt_crackles) + self.BCEloss(pred_wheezes, gt_wheezes) + \
+                           0.2 * self.CEloss(pred_diagnosis, gt_diagnosis)
+
+                    loss.backward()
+                    self.optimizer.step()
+
+                    running_loss += loss.item() * self.batch_size
+
+                    train_loss = running_loss / ((i + 1)*self.batch_size)
+
+                    wandb.log({"train_loss": train_loss})
+                    wandb.log({"loss": loss})
+
+                    pbar.set_description(
+                        f'Epoch {epoch}/{self.start_epoch + self.num_epochs - 1}, training loss {train_loss:.4f}')
+
+                epoch_loss = running_loss / len(self.train_set)
+                print('Epoch {}, Train Loss: {:.4f} '.format(epoch+1, epoch_loss))
+
+                if self.scheduler:
+                    self.scheduler.step()
+                    wandb.log({"learning rate": self.optimizer.param_groups[0]['lr']})
+                    wandb.log({"learning rate head": self.optimizer.param_groups[1]['lr']})
+
+                # Validation phase
+                if (epoch+1) % 1 == 0:
+                    self.model.eval()
+                    for metric in self.metrics:
+                        metric.reset()
+                    print('-' * 10)
+                    print('VAL')
+                    print('-' * 10)
+
+                    val_loss = 0.0
+
+                    pbar = tqdm(self.val_data)
+                    vis_save = []
+                    for i, batch in enumerate(pbar):
+                        audio, label, text_inputs, attn_masks = batch
+
+                        audio = audio.to(self.device)
+                        gt_crackles, gt_wheezes, gt_diagnosis = label
+                        gt_crackles, gt_wheezes, gt_diagnosis = gt_crackles.to(self.device), \
+                                                                gt_wheezes.to(self.device), gt_diagnosis.to(self.device)
+                        gt_crackles, gt_wheezes, gt_diagnosis = \
+                            gt_crackles[:, None].type(torch.float32), gt_wheezes[:, None].type(torch.float32), \
+                            gt_diagnosis[:, None].long().squeeze()
+                        label = (gt_crackles, gt_wheezes, gt_diagnosis)
+                        text_inputs = text_inputs.to(self.device)
+                        attn_masks = attn_masks.to(self.device)
+
+                        with torch.no_grad():
+                            pred_crackles, pred_wheezes, pred_diagnosis = self.model(audio, text_inputs, attn_masks)
+                            loss = self.BCEloss(pred_crackles, gt_crackles) + self.BCEloss(pred_wheezes, gt_wheezes) + \
+                                   0.2 * self.CEloss(pred_diagnosis, gt_diagnosis)
+                            self.metrics[0].update(pred_crackles, gt_crackles)
+                            self.metrics[1].update(pred_wheezes, gt_wheezes)
+                            self.metrics[2].update(pred_diagnosis, gt_diagnosis)
+                            self.metrics[3].update(pred_crackles, pred_wheezes, gt_crackles, gt_wheezes)
+
+                        # if self.vis:
+                        #     vis_outs = vis_result(images, preds, masks)
+                        #     vis_save = vis_save + vis_outs
+                        val_loss += loss.item() * self.batch_size
+
+                    epoch_loss_val = val_loss / len(val_subset)
+                    print('Val Loss: {:.4f} '.format(epoch_loss_val))
+
+                    acc = []
+                    for metric in self.metrics:
+                        acc.append(metric.compute())
+                    print('Crackles Val Acc: {:.4f}. Wheezes Val Acc: {:.4f}. Diagnosis Val Acc: {:.4f}.'
+                          .format(acc[0], acc[1], acc[2]))
+                    print('	ICBHI Score: {:.4f}. Sensitivity: {:.4f}. Specificity: {:.4f}.'
+                          .format(acc[3][0], acc[3][1], acc[3][2]))
+
+                    wandb.log({"Crackles_Acc": acc[0]})
+                    wandb.log({"Wheezes_Acc": acc[1]})
+                    wandb.log({"Diagnosis_Acc": acc[2]})
+                    wandb.log({"ICBHI Score": acc[3][0]})
+                    wandb.log({"Sensitivity": acc[3][1]})
+                    wandb.log({"Specificity": acc[3][2]})
 
 
-                epoch_loss_val = val_loss / len(self.val_set)
-                print('Val Loss: {:.4f} '.format(epoch_loss_val))
-                # for metric in self.metrics:
-                #     metric.update(val_label, val_pred)
-                miou = self.metrics.compute()
-                print('Val mIoU: {:.4f} '.format(miou))
-                wandb.log({"val_miou": miou})
+                    if acc[3][0] > best_iou_test:
+                        best_iou_test = acc[3][0]
+                        best_epoch_test = epoch
+                        best_model_wts_test = copy.deepcopy(self.model.state_dict())
+                        torch.save(best_model_wts_test,
+                                   f"{self.ckpt_path}/{self.model_name}_val_{best_epoch_test}_{best_iou_test:.4f}.pth")
+                        print(f"Saved model at epoch {best_epoch_test} with IOU: {best_iou_test:.4f}")
 
-
-                if miou > best_iou_test:
-                    best_iou_test = miou
-                    best_epoch_test = epoch
-                    best_model_wts_test = copy.deepcopy(self.model.state_dict())
-                    torch.save(best_model_wts_test,
-                               f"{self.ckpt_path}/{self.model_name}_val_{best_epoch_test}_{best_iou_test:.4f}.pth")
-                    print(f"Saved model at epoch {best_epoch_test} with IOU: {best_iou_test:.4f}")
-                    if self.vis:
-                        for i in range(len(vis_save)):
-                            cv2.imwrite(os.path.join(self.vis_path,'val', f'vis_mask_{i}.png'), vis_save[i])
-                else:
-                    if epoch - best_epoch_test >= self.early_stop - 1:
-                        is_earlystop = True
-                        print("Early stopping at epoch " + str(epoch))
+                    else:
+                        if epoch - best_epoch_test >= self.early_stop - 1:
+                            is_earlystop = True
+                            print("Early stopping at epoch " + str(epoch))
 
         time_elapsed = time.time() - since
         print('Training complete in {:.0f}m {:.0f}s'.format(time_elapsed // 60, time_elapsed % 60))
@@ -246,70 +266,58 @@ class Trainer():
         self.model.load_state_dict(best_ckpt)
         self.model.to(self.device)
 
-        self.model.eval()
-
-        with torch.no_grad():
-            for i, (images, file_names) in enumerate(self.test_data):
-                images = images.to(self.device)
-                outputs = self.model(images)
-                preds = torch.argmax(outputs, dim=1)
-                vis_out = vis_result(images, preds)
-
-                for j in range(preds.size(0)):
-                    save_vis_path = os.path.join(self.vis_path, 'test', os.path.splitext(file_names[j])[0] + '.png')
-                    cv2.imwrite(save_vis_path, vis_out[j])
-
-                    save_file_path = os.path.join(self.save_path, os.path.splitext(file_names[j])[0] + '.png')
-                    mask_np = preds[j].cpu().numpy().astype(np.uint8)
-                    mask_image = Image.fromarray(mask_np)
-                    mask_image.save(save_file_path)
-                    print(f'Saved mask to {save_file_path}')
-
-    def f_measure(self, best_ckpt_path):
-        # f1_score = F1(num_classes=18, average=None).to(self.device)  # No averaging for individual F1
-        # confusion_matrix = ConfusionMatrix(num_classes=18).to(self.device)
-
-        best_ckpt = torch.load(best_ckpt_path, map_location='cpu')
-        self.model.load_state_dict(best_ckpt)
-        self.model.to(self.device)
-
-        rape_params = sum(p.numel() for p in self.model.backbone.patch_embed1.parameters())
-        fgde_params = sum(p.numel() for p in self.model.head.fine_grained.parameters())
+        classifier_params = sum(p.numel() for p in self.model.classifier.parameters())
+        fusion_params = sum(p.numel() for p in self.model.classifier.shared_layer.parameters())
+        backbone_params = sum(p.numel() for p in self.model.audio_features.parameters())
         total_params = sum(p.numel() for p in self.model.parameters())
 
-        print(f'RAPE Params {rape_params}')
-        print(f'FGDE Params {fgde_params}')
+        print(f'Head Params {classifier_params}')
+        print(f'Fusion Params {fusion_params}')
+        print(f'Encoder Params {backbone_params}')
         print(f'Total Params {total_params}')
 
         self.model.eval()
-        all_preds = []
-        all_labels = []
+        for metric in self.metrics:
+            metric.reset()
+
+        self.test_data = DataLoader(
+            self.test_set, batch_size=1, shuffle=False,
+        )
+
         with torch.no_grad():
-            for i, (images, masks) in enumerate(self.val_data):
-                images = images.to(self.device)
-                masks = masks.to(self.device)
+            for i, batch in enumerate(tqdm(self.test_data)):
+                audio, label, text_inputs, attn_masks = batch
+
+                audio = audio.to(self.device)
+                gt_crackles, gt_wheezes, gt_diagnosis = label
+                gt_crackles, gt_wheezes, gt_diagnosis = gt_crackles.to(self.device), \
+                                                        gt_wheezes.to(self.device), gt_diagnosis.to(self.device)
+                gt_crackles, gt_wheezes, gt_diagnosis = \
+                    gt_crackles[:, None].type(torch.float32), gt_wheezes[:, None].type(torch.float32), \
+                    gt_diagnosis[:, None].long()
+                text_inputs = text_inputs.to(self.device)
+                attn_masks = attn_masks.to(self.device)
+
                 if i == 0:
-                    flops_rape = FlopCountAnalysis(self.model.backbone.patch_embed1, images).total()
-                    flops_total = FlopCountAnalysis(self.model, images).total()
-                    print(f'RAPE Flops {flops_rape}')
+                    flops_total = FlopCountAnalysis(self.model, (audio, text_inputs, attn_masks)).total()
                     print(f'Total Flops {flops_total}')
-                outputs = self.model(images)
-                preds = torch.argmax(outputs, dim=1)
-                all_preds.append(preds)
-                all_labels.append(masks)
-        all_preds = torch.cat(all_preds)
-        all_labels = torch.cat(all_labels)
-        f1_per_class = f1_score(all_preds, all_labels, task="multiclass", num_classes=19, average=None)
-        f1_average = f1_score(all_preds, all_labels, task="multiclass", num_classes=19)
 
-        print("F1 Score for each class:")
-        print(f1_per_class)
-        print("Average F1 Score")
-        print(f1_average)
+                pred_crackles, pred_wheezes, pred_diagnosis = self.model(audio, text_inputs, attn_masks)
+                self.metrics[0].update(pred_crackles, gt_crackles)
+                self.metrics[1].update(pred_wheezes, gt_wheezes)
+                self.metrics[2].update(pred_diagnosis, gt_diagnosis)
+                self.metrics[3].update(pred_crackles, pred_wheezes, gt_crackles, gt_wheezes)
 
-        mean_iou, ious = calculate_mean_iou(all_preds, all_labels)
-        print(f"Mean IoU: {mean_iou}")
-        print(f"IoU per class: {ious}")
+            acc = []
+            for metric in self.metrics:
+                acc.append(metric.compute())
+            print('Crackles Val Acc: {:.4f}. Wheezes Val Acc: {:.4f}. Diagnosis Val Acc: {:.4f}.'
+                  .format(acc[0], acc[1], acc[2]))
+            print('	ICBHI Score: {:.4f}. Sensitivity: {:.4f}. Specificity: {:.4f}.'
+                  .format(acc[3][0], acc[3][1], acc[3][2]))
+
+
+
 
     def save_checkpoint(self, epoch, best_iou, best_epoch):
         state = {
@@ -343,6 +351,3 @@ class Trainer():
         self.train()
 
 
-#tensor([0.9350, 0.9490, 0.9270, 0.8744, 0.4691, 0.4750, 0.4725, 0.4243, 0.5018,
-#         0.4047, 0.8861, 0.8560, 0.8744, 0.9300, 0.7155, 0.5753, 0.0815, 0.8644,
-#         0.7433], device='cuda:1')

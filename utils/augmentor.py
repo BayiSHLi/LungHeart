@@ -1,4 +1,4 @@
-# augmentator.py
+# augmentor.py
 import torch
 import torchaudio
 import torchaudio.transforms as T
@@ -64,8 +64,6 @@ class AudioAugmentor:
             audio = time_masking(audio, self.sample_rate)
         if torch.rand(1).item() > 0.5:
             audio = pitch_shift(audio, self.sample_rate)
-        if torch.rand(1).item() > 0.5:
-            audio = time_stretch(audio)
         return audio
 
 
